@@ -315,48 +315,48 @@ def _create_report_from_sources(
 
     selected_contracts = _select_contracts(config_sources, limit_to_contracts)
 
-    # Work out which graphs we need, in the order they're first needed, along with which
-    # config sources share each one. If no contracts were selected, we still build the first
-    # graph so the report can describe the codebase.
-    graph_keys_by_filename: dict[str | None, tuple] = {}
-    sources_by_graph_key: dict[tuple, ConfigSource] = {}
-    filenames_by_graph_key: dict[tuple, list[str]] = {}
+    # Build each graph when its first contract needs it. With no selected contracts, the
+    # first graph is still needed so the report can describe the codebase.
+    builds: dict[tuple, tuple[ImportGraph, int, list[str]]] = {}
+    graphs_by_filename: dict[str | None, ImportGraph] = {}
     for config_source, _ in selected_contracts or [(config_sources[0], {})]:
         filename = config_source.filename
-        if filename in graph_keys_by_filename:
+        if filename in graphs_by_filename:
             continue
-        graph_key = _graph_key(config_source.user_options, cache_dir)
-        graph_keys_by_filename[filename] = graph_key
-        sources_by_graph_key.setdefault(graph_key, config_source)
-        filenames_by_graph_key.setdefault(graph_key, []).append(_display_filename(filename))
 
-    graphs: dict[tuple, ImportGraph] = {}
-    report: Report | None = None
-    graph_count = len(sources_by_graph_key)
-    for graph_index, (graph_key, config_source) in enumerate(
-        sources_by_graph_key.items(), start=1
-    ):
         user_options = config_source.user_options
-        spinner_message = (
-            f":brick: Building graph {graph_index}/{graph_count}..."
-            if graph_count > 1
-            else ":brick: Building graph..."
-        )
-        with _get_spinner(spinner_message, verbose):
-            with settings.TIMER as timer:
-                graph = _build_graph(
-                    root_package_names=user_options.session_options["root_packages"],
-                    cache_dir=_get_cache_dir(user_options, cache_dir),
-                    include_external_packages=_get_include_external_packages(user_options),
-                    exclude_type_checking_imports=_get_exclude_type_checking_imports(user_options),
-                    verbose=verbose,
-                )
-        graph_building_duration = timer.duration_in_ms
-        output.verbose_print(
-            verbose, f"Built graph in {format_duration(graph_building_duration)}."
-        )
-        graphs[graph_key] = graph
-        filenames = filenames_by_graph_key[graph_key]
+        effective_cache_dir = _get_cache_dir(user_options, cache_dir)
+        graph_key = _graph_key(user_options, effective_cache_dir)
+        if graph_key not in builds:
+            message = (
+                f":brick: Building graph {len(builds) + 1}..."
+                if builds
+                else ":brick: Building graph..."
+            )
+            with _get_spinner(message, verbose):
+                with settings.TIMER as timer:
+                    graph = _build_graph(
+                        root_package_names=user_options.session_options["root_packages"],
+                        cache_dir=effective_cache_dir,
+                        include_external_packages=_get_include_external_packages(user_options),
+                        exclude_type_checking_imports=_get_exclude_type_checking_imports(
+                            user_options
+                        ),
+                        verbose=verbose,
+                    )
+            duration = timer.duration_in_ms
+            output.verbose_print(verbose, f"Built graph in {format_duration(duration)}.")
+            # Building the graph may have created the cache directory. Record its identity
+            # now so that later configurations can find it through another spelling.
+            graph_key = _graph_key(user_options, effective_cache_dir)
+            builds[graph_key] = (graph, duration, [])
+
+        graph, _, filenames = builds[graph_key]
+        filenames.append(_display_filename(filename))
+        graphs_by_filename[filename] = graph
+
+    report: Report | None = None
+    for graph, graph_building_duration, filenames in builds.values():
         if report is None:
             report = Report(
                 graph=graph,
@@ -377,7 +377,7 @@ def _create_report_from_sources(
                 _get_contract_class(config_source, contract_options["type"]),
                 contract_options,
                 config_source.user_options.session_options,
-                graphs[graph_keys_by_filename[config_source.filename]],
+                graphs_by_filename[config_source.filename],
             )
             for config_source, contract_options in selected_contracts
         ],
@@ -399,20 +399,34 @@ def _get_contract_class(config_source: ConfigSource, contract_type: str) -> type
     return registry.get_contract_class(contract_type)
 
 
-def _graph_key(user_options: UserOptions, cache_dir: str | None | type[NotSupplied]) -> tuple:
+def _graph_key(user_options: UserOptions, cache_dir: str | None) -> tuple:
     """
     Return a hashable key identifying the graph needed for the supplied user options.
 
     Two sets of user options with the same key can share a graph.
     """
-    effective_cache_dir = _get_cache_dir(user_options, cache_dir)
     return (
         tuple(sorted(user_options.session_options["root_packages"])),
         # An omitted include_external_packages (None) behaves the same as False.
         bool(_get_include_external_packages(user_options)),
         _get_exclude_type_checking_imports(user_options),
-        _absolute_path(effective_cache_dir) if effective_cache_dir is not None else None,
+        _cache_dir_identity(cache_dir),
     )
+
+
+def _cache_dir_identity(cache_dir: str | None) -> tuple[int, int] | str | None:
+    if cache_dir is None:
+        return None
+    try:
+        stat = os.stat(cache_dir)
+    except OSError:
+        pass
+    else:
+        if stat.st_ino:
+            return stat.st_dev, stat.st_ino
+    # A cold cache might not exist yet. Preserve case here: the filesystem decides
+    # whether case variants refer to the same directory.
+    return os.path.realpath(cache_dir)
 
 
 def _get_cache_dir(

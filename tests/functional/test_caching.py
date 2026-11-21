@@ -86,6 +86,33 @@ class TestCaching:
         else:
             assert "Config files" not in result.output  # Both contracts share a single graph.
 
+    @pytest.mark.parametrize("precreate_cache", [False, True])
+    def test_case_variants_share_a_graph_if_they_share_a_cache(
+        self, tmp_path, monkeypatch, precreate_cache
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.syspath_prepend(str(testpackage_directory))
+        config = (testpackage_directory / "setup.cfg").read_text()
+        cache_dirs = [tmp_path / "Cache", tmp_path / "cache"]
+        if precreate_cache:
+            for cache_dir in cache_dirs:
+                cache_dir.mkdir(exist_ok=True)
+        for filename, cache_dir in zip(["one.ini", "two.ini"], cache_dirs):
+            (tmp_path / filename).write_text(
+                config.replace("[importlinter]", f"[importlinter]\ncache_dir = {cache_dir.name}")
+            )
+
+        result = CliRunner().invoke(cli.lint_imports_command, ["one.ini", "two.ini", "--verbose"])
+
+        assert result.exit_code == cli.EXIT_STATUS_SUCCESS, result.output
+        assert "Contracts: 2 kept, 0 broken." in result.output
+        for cache_dir in cache_dirs:
+            assert (cache_dir / "testpackage.meta.json").is_file()
+        # The host filesystem, including its per-volume case rules, determines whether
+        # the two spellings point to the same cache.
+        expected_builds = 1 if cache_dirs[0].samefile(cache_dirs[1]) else 2
+        assert result.output.count("Building import graph (") == expected_builds
+
     @pytest.mark.parametrize("value", ['""', "false", '["first", "second"]'])
     def test_rejects_invalid_cache_dir(self, tmp_path, monkeypatch, value):
         monkeypatch.chdir(tmp_path)
