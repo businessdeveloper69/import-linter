@@ -1,0 +1,59 @@
+name: Native cache directory verification
+on:
+  push:
+    branches: [verify/import-linter-432-native]
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'businessdeveloper69/import-linter'
+    name: Cache checks on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: e2916dc524fcae3705fee7f2a59f2f07f8edf81c
+          path: candidate
+          persist-credentials: false
+      - name: Verify candidate commit and tree
+        shell: bash
+        working-directory: candidate
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = e2916dc524fcae3705fee7f2a59f2f07f8edf81c
+          test "$(git rev-parse HEAD^{tree})" = 7c08f65dc14264387efb7365bec5638e0af91a8b
+          git log -1 --format='%H %T'
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Upstream CLI smoke commands
+        working-directory: candidate
+        run: |
+          uv run --frozen lint-imports
+          uv run --frozen import-linter lint
+          uv run --frozen import-linter drawgraph importlib
+        shell: bash
+      - name: Upstream cache regression tests
+        working-directory: candidate
+        run: uv run --frozen pytest -q -m "not no_ui_deps_installed" tests/functional/test_caching.py tests/unit/application/test_use_cases.py::TestMultipleConfigFiles::test_equivalent_cache_directories_share_one_graph
+      - name: Verify native cache directory identities and files
+        if: ${{ !cancelled() }}
+        working-directory: candidate
+        run: uv run --frozen python ../harness/.github/scripts/verify-cache-paths.py
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() }}
+        with:
+          name: native-cache-${{ matrix.os }}
+          path: candidate/native-cache-report.json
+          if-no-files-found: error
