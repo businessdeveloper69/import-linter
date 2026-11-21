@@ -307,8 +307,8 @@ def _create_report_from_sources(
     Check the contracts from one or more config sources, returning a report on the results.
 
     A graph is built once for each distinct graph configuration (root packages,
-    include_external_packages and exclude_type_checking_imports), and shared by every
-    contract that needs it.
+    include_external_packages, exclude_type_checking_imports and cache directory), and shared
+    by every contract that needs it.
     """
     for config_source in config_sources:
         _validate_contract_ids(config_source)
@@ -318,15 +318,17 @@ def _create_report_from_sources(
     # Work out which graphs we need, in the order they're first needed, along with which
     # config sources share each one. If no contracts were selected, we still build the first
     # graph so the report can describe the codebase.
+    graph_keys_by_filename: dict[str | None, tuple] = {}
     sources_by_graph_key: dict[tuple, ConfigSource] = {}
     filenames_by_graph_key: dict[tuple, list[str]] = {}
     for config_source, _ in selected_contracts or [(config_sources[0], {})]:
-        graph_key = _graph_key(config_source.user_options)
+        filename = config_source.filename
+        if filename in graph_keys_by_filename:
+            continue
+        graph_key = _graph_key(config_source.user_options, cache_dir)
+        graph_keys_by_filename[filename] = graph_key
         sources_by_graph_key.setdefault(graph_key, config_source)
-        display_name = _display_filename(config_source.filename)
-        filenames = filenames_by_graph_key.setdefault(graph_key, [])
-        if display_name not in filenames:
-            filenames.append(display_name)
+        filenames_by_graph_key.setdefault(graph_key, []).append(_display_filename(filename))
 
     graphs: dict[tuple, ImportGraph] = {}
     report: Report | None = None
@@ -344,7 +346,7 @@ def _create_report_from_sources(
             with settings.TIMER as timer:
                 graph = _build_graph(
                     root_package_names=user_options.session_options["root_packages"],
-                    cache_dir=cache_dir,
+                    cache_dir=_get_cache_dir(user_options, cache_dir),
                     include_external_packages=_get_include_external_packages(user_options),
                     exclude_type_checking_imports=_get_exclude_type_checking_imports(user_options),
                     verbose=verbose,
@@ -375,7 +377,7 @@ def _create_report_from_sources(
                 _get_contract_class(config_source, contract_options["type"]),
                 contract_options,
                 config_source.user_options.session_options,
-                graphs[_graph_key(config_source.user_options)],
+                graphs[graph_keys_by_filename[config_source.filename]],
             )
             for config_source, contract_options in selected_contracts
         ],
@@ -397,18 +399,33 @@ def _get_contract_class(config_source: ConfigSource, contract_type: str) -> type
     return registry.get_contract_class(contract_type)
 
 
-def _graph_key(user_options: UserOptions) -> tuple:
+def _graph_key(user_options: UserOptions, cache_dir: str | None | type[NotSupplied]) -> tuple:
     """
     Return a hashable key identifying the graph needed for the supplied user options.
 
     Two sets of user options with the same key can share a graph.
     """
+    effective_cache_dir = _get_cache_dir(user_options, cache_dir)
     return (
         tuple(sorted(user_options.session_options["root_packages"])),
         # An omitted include_external_packages (None) behaves the same as False.
         bool(_get_include_external_packages(user_options)),
         _get_exclude_type_checking_imports(user_options),
+        _absolute_path(effective_cache_dir) if effective_cache_dir is not None else None,
     )
+
+
+def _get_cache_dir(
+    user_options: UserOptions, override: str | None | type[NotSupplied]
+) -> str | None:
+    if not isinstance(override, type):
+        return override
+    if "cache_dir" not in user_options.session_options:
+        return settings.DEFAULT_CACHE_DIR
+    cache_dir = user_options.session_options["cache_dir"]
+    if not isinstance(cache_dir, str) or not cache_dir:
+        raise InvalidUserOptions("cache_dir must be a non-empty directory path.")
+    return cache_dir
 
 
 def _absolute_path(filename: str) -> str:
@@ -483,12 +500,9 @@ def _build_graph(
     include_external_packages: bool | None,
     exclude_type_checking_imports: bool,
     verbose: bool,
-    cache_dir: str | None | type[NotSupplied] = NotSupplied,
+    cache_dir: str | None,
 ) -> ImportGraph:
     _validate_root_package_names(root_package_names)
-
-    if cache_dir == NotSupplied:
-        cache_dir = settings.DEFAULT_CACHE_DIR
 
     if cache_dir:
         output.verbose_print(verbose, f"Building import graph (cache directory is {cache_dir})...")
