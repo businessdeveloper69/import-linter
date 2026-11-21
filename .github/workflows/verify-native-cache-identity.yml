@@ -1,0 +1,102 @@
+name: Verify native cache identity
+on:
+  push:
+    branches: [verify/import-linter-432-cache-identity]
+permissions:
+  contents: read
+
+env:
+  REVIEW_SHA: "f0de62c169836ec0cbf830119d526d07ac7d0835"
+  REVIEW_TREE: "99cf8bc137637461a989ae0ee5cf9109329d1131"
+  SUBMITTED_SHA: "e2916dc524fcae3705fee7f2a59f2f07f8edf81c"
+
+jobs:
+  verify:
+    if: github.repository == 'businessdeveloper69/import-linter'
+    name: Cache identity on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REVIEW_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SUBMITTED_SHA }}
+          path: submitted
+          persist-credentials: false
+      - name: Verify both source revisions
+        shell: bash
+        run: |
+          set -eu
+          test "$(git -C candidate rev-parse HEAD)" = "$REVIEW_SHA"
+          test "$(git -C candidate rev-parse HEAD^{tree})" = "$REVIEW_TREE"
+          test "$(git -C submitted rev-parse HEAD)" = "$SUBMITTED_SHA"
+          test "$(git -C submitted rev-parse HEAD^{tree})" = 7c08f65dc14264387efb7365bec5638e0af91a8b
+          git -C candidate log -1 --format='%H %T'
+          git -C submitted log -1 --format='%H %T'
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Run all three upstream CLI smoke commands
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -eu
+          uv run --frozen lint-imports
+          uv run --frozen import-linter lint
+          uv run --frozen import-linter drawgraph importlib
+      - name: Run upstream caching and grouped graph tests
+        working-directory: candidate
+        run: uv run --frozen pytest -q -m "not no_ui_deps_installed" tests/functional/test_caching.py tests/unit/application/test_use_cases.py::TestMultipleConfigFiles::test_equivalent_cache_directories_share_one_graph
+      - name: Prepare case-sensitive APFS volume
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eu
+          diskutil info / | grep -E 'File System Personality|Type \(Bundle\)'
+          mkdir "$RUNNER_TEMP/case-test-volume"
+          hdiutil create -size 128m -fs APFSX -volname CacheCases "$RUNNER_TEMP/cache-cases.dmg"
+          hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/case-test-volume" "$RUNNER_TEMP/cache-cases.dmg"
+          diskutil info "$RUNNER_TEMP/case-test-volume" | grep -E 'File System Personality|Type \(Bundle\)'
+      - name: Check submitted changes and candidate against the native filesystems
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -eu
+          for src in submitted candidate; do
+            if [ "$src" = submitted ]; then sha="$SUBMITTED_SHA"; else sha="$REVIEW_SHA"; fi
+            (
+              cd "$src"
+              script=../harness/.github/scripts/verify-cache-paths.py
+              extra=()
+              if [ "$RUNNER_OS" = macOS ] && [ "$src" = submitted ]; then extra=(--expected-duplicate); fi
+              uv run --frozen python "$script" --source "$sha" --filesystem case-insensitive --label "$src-default" "${extra[@]}"
+              if [ "$RUNNER_OS" = macOS ]; then
+                uv run --frozen python "$script" --source "$sha" --filesystem case-sensitive --label "$src-sensitive" --parent "$RUNNER_TEMP/case-test-volume"
+              fi
+            )
+          done
+      - name: Detach temporary disk image
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        shell: bash
+        run: hdiutil detach "$RUNNER_TEMP/case-test-volume"
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() }}
+        with:
+          name: cache-identity-${{ matrix.os }}
+          path: |
+            submitted/cache-probe-*.json
+            candidate/cache-probe-*.json
+          if-no-files-found: error
